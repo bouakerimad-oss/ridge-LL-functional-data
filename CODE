@@ -1,0 +1,130 @@
+
+============================================================
+# Ridge LL estimator for functional conditional density
+# ============================================================
+
+# Numerical integration (trapezoidal rule)
+trapz <- function(x, y) {
+  n <- length(x)
+  if (n < 2) return(0)
+  sum(diff(x) * (y[-1] + y[-n]) / 2)
+}
+
+# Epanechnikov kernel
+K_epan <- function(u) ifelse(abs(u) <= 1, 0.75 * (1 - u^2), 0)
+
+# Gaussian kernel
+L_gauss <- dnorm
+
+# ------------------------------------------------------------
+#NW estimator
+# ------------------------------------------------------------
+NW <- function(x0, y0, X, Y, t, hK, hH) {
+  n <- nrow(X)
+  d <- sapply(1:n, function(i) sqrt(trapz(t, (x0 - X[i,])^2)))
+  Kd <- K_epan(d / hK)
+  if (sum(Kd) == 0) return(0)
+  Ly <- L_gauss((y0 - Y) / hH)
+  sum(Kd * Ly) / (sum(Kd) * hH)
+}
+
+# ------------------------------------------------------------
+# Ridge Local Linear estimator
+# ------------------------------------------------------------
+LL_ridge <- function(x0, y0, X, Y, t, hK, hH, delta = 1e-6) {
+  n <- nrow(X)
+  d <- sapply(1:n, function(i) sqrt(trapz(t, (x0 - X[i,])^2)))
+  Kd <- K_epan(d / hK)
+  if (sum(Kd) < 2) return(0)          # not enough neighbours
+  s0 <- sum(Kd); s1 <- sum(Kd * d); s2 <- sum(Kd * d^2)
+  mat <- matrix(c(s0 + delta, s1, s1, s2 + delta), 2, 2)
+  rhs <- c(sum(Kd * L_gauss((y0 - Y) / hH)),
+           sum(Kd * d * L_gauss((y0 - Y) / hH)))
+  beta <- solve(mat, rhs)
+  beta[1]                             # a0 = estimated density
+}
+
+# ------------------------------------------------------------
+# Generate functional data (Fourier basis + AR(1) coefficients)
+# ------------------------------------------------------------
+gen_data <- function(n, rho, n_basis = 3, n_points = 40) {
+  t <- seq(0, 1, length.out = n_points)
+  phi <- matrix(0, n_points, n_basis)
+  for (k in 1:n_basis) {
+    phi[, k] <- sqrt(2) * sin((k - 0.5) * pi * t)
+  }
+  xi <- matrix(0, n, n_basis)
+  for (k in 1:n_basis) {
+    sigma2 <- 1 / (k^2)
+    if (rho == 0) {
+      xi[, k] <- rnorm(n, 0, sqrt(sigma2))
+    } else {
+      e <- rnorm(n, 0, sqrt(sigma2 * (1 - rho^2)))
+      xi[1, k] <- e[1]
+      for (i in 2:n) xi[i, k] <- rho * xi[i-1, k] + e[i]
+    }
+  }
+  X <- xi %*% t(phi)
+  beta1 <- sin(2 * pi * t); beta2 <- cos(2 * pi * t)
+  int1 <- apply(X, 1, function(row) trapz(t, row * beta1))
+  int2 <- apply(X, 1, function(row) trapz(t, row * beta2))
+  Y <- int1 + int2^2 + rnorm(n, 0, 0.3)
+  list(X = X, Y = Y, t = t, int1 = int1, int2 = int2)
+}
+
+# ------------------------------------------------------------
+# Silverman bandwidth selector
+# ------------------------------------------------------------
+silverman <- function(x) 0.9 * min(sd(x), IQR(x)/1.34) * length(x)^(-0.2)
+
+# ------------------------------------------------------------
+# Main simulation (500 replications)
+# ------------------------------------------------------------
+set.seed(123)
+n_sim <- 500
+sample_sizes <- c(100, 200, 500)
+rho_vals <- c(0.3, 0.6)
+y_grid <- seq(-2.5, 4.5, length = 80)
+
+results_ISE <- array(NA, dim = c(length(sample_sizes), length(rho_vals), 2),
+                     dimnames = list(n = sample_sizes, rho = rho_vals,
+                                     method = c("ridgeLL", "NW")))
+
+for (n in sample_sizes) {
+  for (rho in rho_vals) {
+    cat(sprintf("\nRunning n = %d, rho = %.1f\n", n, rho))
+    ISE_ridge <- numeric(n_sim)
+    ISE_NW    <- numeric(n_sim)
+    for (sim in 1:n_sim) {
+      if (sim %% 50 == 0) cat(".")
+      # generate data
+      dat <- gen_data(n, rho, n_basis = 3, n_points = 40)
+      X <- dat$X; Y <- dat$Y; t <- dat$t
+      x0 <- colMeans(X)
+      # true density parameters at x0
+      int1_true <- trapz(t, x0 * sin(2*pi*t))
+      int2_true <- trapz(t, x0 * cos(2*pi*t))
+      true_dens <- function(y) dnorm(y, mean = int1_true + int2_true^2, sd = 0.3)
+      # bandwidths
+      d_all <- sapply(1:n, function(i) sqrt(trapz(t, (x0 - X[i,])^2)))
+      hK_NW <- silverman(d_all)
+      hH    <- silverman(Y)
+      hK_LL <- 0.6 * hK_NW
+      # estimate densities on grid
+      ridge_est <- sapply(y_grid, function(y) LL_ridge(x0, y, X, Y, t, hK_LL, hH))
+      nw_est    <- sapply(y_grid, function(y) NW(x0, y, X, Y, t, hK_NW, hH))
+      true_vals <- sapply(y_grid, true_dens)
+      # ISE
+      ISE_ridge[sim] <- trapz(y_grid, (ridge_est - true_vals)^2)
+      ISE_NW[sim]    <- trapz(y_grid, (nw_est - true_vals)^2)
+    }
+    results_ISE[as.character(n), as.character(rho), "ridgeLL"] <- mean(ISE_ridge)
+    results_ISE[as.character(n), as.character(rho), "NW"]      <- mean(ISE_NW)
+    cat("\n")
+  }
+}
+
+print(results_ISE)
+
+
+
